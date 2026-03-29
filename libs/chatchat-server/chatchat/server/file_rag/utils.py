@@ -3,12 +3,14 @@ from chatchat.server.file_rag.retrievers import (
     EnsembleRetrieverService,
     VectorstoreRetrieverService,
     MilvusVectorstoreRetrieverService,
+    MilvusHybridRetrieverService,
 )
 
 Retrivals = {
     "milvusvectorstore": MilvusVectorstoreRetrieverService,
     "vectorstore": VectorstoreRetrieverService,
     "ensemble": EnsembleRetrieverService,
+    "milvushybrid": MilvusHybridRetrieverService,
 }
 
 
