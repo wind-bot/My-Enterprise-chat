@@ -254,6 +254,16 @@ class KBSettings(BaseFileSettings):
     EMBEDDING_KEYWORD_FILE: str = "embedding_keywords.txt"
     """Embedding模型定制词语的词表文件"""
 
+    # ── Reranker 精排配置 ──────────────────────────────────
+    USE_RERANKER: bool = False
+    """是否启用 Reranker 精排"""
+    RERANKER_MODEL: str = "BAAI/bge-reranker-base"
+    """Reranker 模型名称（约 1GB，第一次运行自动下载）"""
+    RERANKER_TOP_N: int = 3
+    """精排后保留多少条文档给 LLM"""
+    RERANKER_MAX_LENGTH: int = 1024
+    """精排模型最大输入长度"""
+
 
 class PlatformConfig(MyBaseModel):
     """模型加载平台配置"""

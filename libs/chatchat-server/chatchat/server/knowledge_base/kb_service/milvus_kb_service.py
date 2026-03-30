@@ -14,7 +14,9 @@ from chatchat.server.knowledge_base.kb_service.base import (
     score_threshold_process,
 )
 from chatchat.server.knowledge_base.utils import KnowledgeFile
+from chatchat.utils import build_logger
 
+logger = build_logger()
 
 class MilvusKBService(KBService):
     milvus: Milvus
@@ -86,7 +88,7 @@ class MilvusKBService(KBService):
             FunctionType,
         )
         from chatchat.settings import Settings
-
+        # 连接数据库获取数据库对象
         conn = Settings.kb_settings.kbs_config.get("milvus")
         uri = f"http://{conn.get('host', '127.0.0.1')}:{conn.get('port', '19530')}"
         client = MilvusClient(uri=uri)
@@ -103,18 +105,18 @@ class MilvusKBService(KBService):
             # 字段不完整，删掉旧的
             client.drop_collection(col_name)
 
-        # ★ 关键：动态探测 Embedding 模型的真实输出维度，不能写死
+        # 关键：动态探测 Embedding 模型的真实输出维度，不能写死
         # 不同模型维度不一样：bge-m3 = 1024, embedding-3 = 2048, text-embedding-3-large = 3072
         embed_func = get_Embeddings(self.embed_model)
         test_vec = embed_func.embed_query("维度探测")
         actual_dim = len(test_vec)
         print(f"[MilvusKBService] 探测到 Embedding 维度：{actual_dim}")
 
-        # ★ 核心：用 pymilvus 原生 API 手动建 Schema，加入两种向量字段
+        # 核心：用 pymilvus 原生 API 手动建 Schema，加入两种向量字段
         schema = client.create_schema()
-        schema.add_field("pk", DataType.INT64, is_primary=True, auto_id=True)
+        schema.add_field("pk", DataType.INT64, is_primary=True, auto_id=True) # 主键id
         schema.add_field("text", DataType.VARCHAR, max_length=65535,
-                         enable_analyzer=True)                       # 开启分词分析器，供 BM25 使用
+                         enable_analyzer=True)                       # 开启分词分析器，供 BM25 使用 文本内容
         schema.add_field("vector", DataType.FLOAT_VECTOR,
                          dim=actual_dim)                             # Dense 向量（动态维度）
         schema.add_field("sparse_vector", DataType.SPARSE_FLOAT_VECTOR)  # BM25 稀疏向量
@@ -122,11 +124,12 @@ class MilvusKBService(KBService):
                          default_value="")                           # 文件来源
 
         # 定义 BM25 内置函数：自动把 text 字段的文本转换成 sparse_vector 稀疏向量
+        # 把所有的text做分词处理，生成稀疏向量，这里没有建立索引
         bm25_function = Function(
             name="bm25",
             function_type=FunctionType.BM25,
-            input_field_names=["text"],
-            output_field_names=["sparse_vector"],
+            input_field_names=["text"], # 从text读取原始文本
+            output_field_names=["sparse_vector"], # 自动生成，写入sparse_vector字段
         )
         schema.add_function(bm25_function)
 
@@ -154,23 +157,42 @@ class MilvusKBService(KBService):
 
     def do_search(self, query: str, top_k: int, score_threshold: float):
         """
-            改造前：只走 Dense 向量检索
-            改造后：走 Dense + BM25 Sparse 混合检索
+        改造前：只走 Dense 向量检索
+        改造后：走 Dense + BM25 Sparse 混合检索
             为什么要在这里改？
             因为 do_search 是知识库被调用时的入口函数，
             用户问一个问题 → 调用 do_search → 返回相关文档 → 这些文档被拼到 Prompt 里给 LLM
             只要改这一个函数，整个知识库的检索链路就全部升级了
-    """
+        ----------
+         两阶段检索：粗召回(hybrid) + 精排(reranker)
+        链路：
+            1. hybrid_search 召回 Top-20 候选（多召回，宁多勿少）
+            2. 如果 USE_RERANKER=true，用 Cross-Encoder 精排，取 Top-3
+            3. 返回高质量文档给 LLM
+        """
         self._load_milvus()
         # embed_func = get_Embeddings(self.embed_model)
         # embeddings = embed_func.embed_query(query)
         # docs = self.milvus.similarity_search_with_score_by_vector(embeddings, top_k)
+        #步骤一，粗排 混合检索
         retriever = get_Retriever("milvushybrid").from_vectorstore(
             self.milvus,
-            top_k=top_k,
+            top_k=top_k * 5,
             score_threshold=score_threshold,
         )
         docs = retriever.get_relevant_documents(query)
+
+        # 精排reranker
+        if Settings.kb_settings.USE_RERANKER and len(docs) > 0:
+            from chatchat.server.reranker.reranker import LangchainReranker
+            reranker = LangchainReranker(
+                model_name_or_path=Settings.kb_settings.RERANKER_MODEL,
+                top_n = top_k,  # 精排后只留 top_k 条
+                device="cpu",   # Mac 没有 CUDA，用 cpu
+                max_length=Settings.kb_settings.RERANKER_MAX_LENGTH,
+                )
+            docs = reranker.compress_documents(documents=docs,query=query)
+            logger.info(f"[Reranker] 精排完成，从 {top_k * 5} 条候选 → 保留 {len(docs)} 条")
         return docs
 
     def do_add_doc(self, docs: List[Document], **kwargs) -> List[Dict]:
@@ -211,6 +233,7 @@ class MilvusKBService(KBService):
             data.append(row)
 
         # 执行批量插入
+        # 这里milvus 会计算BM25需要的向量表
         result = client.insert(collection_name=self.kb_name, data=data)
 
         # 把 Milvus 返回的 id 列表和原始 metadata 打包成上层需要的格式

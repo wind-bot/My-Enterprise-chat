@@ -7,7 +7,7 @@ from typing import Any, List, Optional, Sequence
 from langchain.callbacks.manager import Callbacks
 from langchain.retrievers.document_compressors.base import BaseDocumentCompressor
 from langchain_core.documents import Document
-from pydantic import Field, PrivateAttr
+from pydantic.v1 import Field, PrivateAttr
 from sentence_transformers import CrossEncoder
 
 
@@ -47,12 +47,12 @@ class LangchainReranker(BaseDocumentCompressor):
         # self.num_workers=num_workers
         # self.activation_fct=activation_fct
         # self.apply_softmax=apply_softmax
-
+# 初始化：加载 Cross-Encoder 模型
 # 这里调用了 NLP 界大名鼎鼎的 sentence-transformers 库的 CrossEncoder 类-
 # 在这个瞬间，机器把几个 G 的 Reranker 模型（比如 BAAI 的 bge-reranker）从磁盘生生拽进了内存或 GPU (device="cuda") 中。
 # 注意参数 max_length，它在强行规定专家审阅每一篇文章的最长字数，防止内存被撑爆。
         self._model = CrossEncoder(
-            model_name=model_name_or_path, max_length=max_length, device=device
+            model_name_or_path=model_name_or_path, max_length=max_length, device=device
         )
         super().__init__(
             top_n=top_n,
@@ -65,7 +65,7 @@ class LangchainReranker(BaseDocumentCompressor):
             # activation_fct=activation_fct,
             # apply_softmax=apply_softmax
         )
-
+    # 核心方法：接收候选文档列表 + 用户问题 → 返回精排后的 Top-N
     def compress_documents(
         self,
         documents: Sequence[Document],
@@ -87,18 +87,17 @@ class LangchainReranker(BaseDocumentCompressor):
             return []
         doc_list = list(documents)
         _docs = [d.page_content for d in doc_list]
+        # 把每个 doc 和 query 拼成 [query, doc] 对
         sentence_pairs = [[query, _doc] for _doc in _docs]
+        # 送入 Cross-Encoder，得到每对的相关性分数
         results = self._model.predict(
             sentences=sentence_pairs,
             batch_size=self.batch_size,
-            #  show_progress_bar=self.show_progress_bar,
-            num_workers=self.num_workers,
-            #  activation_fct=self.activation_fct,
             #  apply_softmax=self.apply_softmax,
             convert_to_tensor=True,
         )
         top_k = self.top_n if self.top_n < len(results) else len(results)
-
+        # 取分数最高的 top_n 个文档返回
         values, indices = results.topk(top_k)
         final_results = []
         for value, index in zip(values, indices):
