@@ -122,6 +122,9 @@ class MilvusKBService(KBService):
         schema.add_field("sparse_vector", DataType.SPARSE_FLOAT_VECTOR)  # BM25 稀疏向量
         schema.add_field("source", DataType.VARCHAR, max_length=512,
                          default_value="")                           # 文件来源
+        #=====父子分层检索新增字段========
+        schema.add_field("parent_id", DataType.VARCHAR, max_length=64, default_value="") # 父文档的家族ID
+        schema.add_field("is_parent", DataType.BOOL, default_value=False)                # 标记身份：True为父，False为子
 
         # 定义 BM25 内置函数：自动把 text 字段的文本转换成 sparse_vector 稀疏向量
         # 把所有的text做分词处理，生成稀疏向量，这里没有建立索引
@@ -164,7 +167,8 @@ class MilvusKBService(KBService):
             用户问一个问题 → 调用 do_search → 返回相关文档 → 这些文档被拼到 Prompt 里给 LLM
             只要改这一个函数，整个知识库的检索链路就全部升级了
         ----------
-         两阶段检索：粗召回(hybrid) + 精排(reranker)
+        改造二阶段召回+精排序 
+        两阶段检索：粗召回(hybrid) + 精排(reranker)
         链路：
             1. hybrid_search 召回 Top-20 候选（多召回，宁多勿少）
             2. 如果 USE_RERANKER=true，用 Cross-Encoder 精排，取 Top-3
@@ -179,10 +183,33 @@ class MilvusKBService(KBService):
             self.milvus,
             top_k=top_k * 5,
             score_threshold=score_threshold,
+            # 因为加了父子模块，只对比子段（注意：Milvus 的 sql 表达式中布尔值要用小写 false）
+            search_kwargs = {"expr":"is_parent == false"}
         )
         docs = retriever.get_relevant_documents(query)
-
-        # 精排reranker
+        # 父子模块--此时的 docs 全是十几到几十个字的精准词条，我们把他们的家谱 ID 抽出来去重
+        parent_ids = list(set([str(doc.metadata.get("parent_id")) for doc in docs if doc.metadata.get("parent_id")]))
+        if parent_ids:
+            from pymilvus import MilvusClient
+            conn = Settings.kb_settings.kbs_config.get("milvus")
+            uri = f"http://{conn.get('host', '127.0.0.1')}:{conn.get('port', '19530')}"
+            client = MilvusClient(uri=uri)
+            # 去 Milvus 中原生拉取这些 ID 对应的父文档（is_parent == true）
+            id_str = "[" + ",".join([f"'{id}'" for id in parent_ids ]) + "]"
+            parent_res = client.query(
+                collection_name = self.kb_name,
+                filter=f"parent_id in {id_str} and is_parent == true",
+                output_fields = ["text", "source", "parent_id"]
+            )
+            # 整理成 Langchain Document 格式
+            docs = []
+            for p in parent_res:
+                docs.append(Document(
+                    page_content = p["text"],
+                    metadata={"source": p["source"], "parent_id": p["parent_id"], "is_parent": True}
+                ))
+            logger.info(f"[Parent-Child] 小块命中，成功拉回 {len(parent_res)} 个宽泛语境大块！")
+        # 步骤二、精排reranker
         if Settings.kb_settings.USE_RERANKER and len(docs) > 0:
             from chatchat.server.reranker.reranker import LangchainReranker
             reranker = LangchainReranker(
@@ -217,21 +244,60 @@ class MilvusKBService(KBService):
 
         # 调用 Embedding 模型，批量把所有文档的文本转成向量
         embed_func = get_Embeddings(self.embed_model)
-        texts = [doc.page_content for doc in docs]
-        vectors = embed_func.embed_documents(texts)
+        # texts = [doc.page_content for doc in docs]
+        # vectors = embed_func.embed_documents(texts)
 
         # 拼装成 Milvus 要求的插入格式：一个字典的列表
         # 每个字典代表一行数据，只需提供 Schema 中我们定义的字段
         # sparse_vector 字段由 Milvus BM25 函数自动生成，不需要我们填
-        data = []
-        for doc, vec in zip(docs, vectors):
-            row = {
-                "text": doc.page_content,
-                "vector": vec,
-                "source": str(doc.metadata.get("source", "")),
-            }
-            data.append(row)
+        # data = []
+        # for doc, vec in zip(docs, vectors):
+        #     row = {
+        #         "text": doc.page_content,
+        #         "vector": vec,
+        #         "source": str(doc.metadata.get("source", "")),
+        #     }
+        #     data.append(row)
 
+        #=============修改父子模块============
+        # 调用 Chatchat 开源项目本土化定制的中文切分器（比官方 langchain 更懂中文段落）
+        from chatchat.server.file_rag.text_splitter.chinese_recursive_text_splitter import ChineseRecursiveTextSplitter
+        import uuid
+
+        # 定义一个 150 字的小刀，把长文档（Parent）按照中文语境切碎
+        child_splitter = ChineseRecursiveTextSplitter(chunk_size=150, chunk_overlap=20)
+        data = []
+        all_text = []
+        temp_records = []
+        for doc in docs:
+            # 1.父id
+            parent_id = uuid.uuid4().hex
+            # 2.存入完整的父节点并打上is_parent:True
+            temp_records.append({
+                "text":doc.page_content,
+                "source":str(doc.metadata.get("source","")),
+                "parent_id":parent_id,
+                "is_parent":True,
+            })
+            all_text.append(doc.page_content)
+
+            # 3.将大段落劈成小段落，也就是子段落,打上 is_parent: False，绑定同一个 parent_id
+            child_docs = child_splitter.split_documents([doc])
+            for child in child_docs:
+                temp_records.append({
+                    "text":child.page_content,
+                    "source":str(child.metadata.get("source","")),
+                    "parent_id":parent_id,
+                    "is_parent":False
+                })
+                all_text.append(child.page_content)
+        # 4.批量向量化-将大段和子段都向量化
+        vectors = embed_func.embed_documents(all_text)
+        # 5.将向量和数据拼装成milvus需要的格式
+        for record,vec in zip(temp_records,vectors):
+            record["vector"] = vec
+            data.append(record)
+        #=============修改父子模块============
         # 执行批量插入
         # 这里milvus 会计算BM25需要的向量表
         result = client.insert(collection_name=self.kb_name, data=data)
