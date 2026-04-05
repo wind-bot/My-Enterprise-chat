@@ -68,7 +68,7 @@ class MilvusHybridRetrieverService(BaseRetrieverService):
             embedding_function = embedding_function,
             top_k = top_k,
             score_threshold = score_threshold,
-            search_kwargs=kwargs.get("search_kwargs", {})
+            search_kwargs=kwargs.get("search_kwargs", {}) #父子文档参数
         )
 
     def get_relevant_documents(self, query: str) -> List[Document]:
@@ -103,7 +103,7 @@ class MilvusHybridRetrieverService(BaseRetrieverService):
         logger.info(f"[混合检索] query进行embedding: {query[:50]}...")
         query_dense_vector = self.embedding_function.embed_query(query)
 
-        # 提取外界传进来的过滤条件
+        # 提取外界传进来的过滤条件--父子文档模块参数
         expr = self.search_kwargs.get("expr", None)
 
         # 3. 构建向量检索请求（语义检索）
@@ -115,7 +115,7 @@ class MilvusHybridRetrieverService(BaseRetrieverService):
             anns_field="vector",
             param={"metric_type": "IP", "params": {"ef": 200}},
             limit=self.top_k * 5,  # 多取一些，最后RRF再裁减到top_k
-            expr=expr, # === 这里透传过滤条件 ===
+            expr=expr, # === 这里透传过滤条件 === 父子文档模块参数
         )
 
         # 4. 关键字检索（BM25 稀疏检索）
@@ -126,7 +126,7 @@ class MilvusHybridRetrieverService(BaseRetrieverService):
             anns_field="sparse_vector",
             param={"metric_type": "BM25"},
             limit=self.top_k * 5,
-            expr=expr, # === 这里透传过滤条件 ===
+            expr=expr, # === 这里透传过滤条件 ===父子文档模块参数
         )
 
         # 5. 使用 RRF 融合两路检索结果
@@ -136,9 +136,11 @@ class MilvusHybridRetrieverService(BaseRetrieverService):
         rrf_ranker = RRFRanker(k=60)
 
         # 6. 执行混合检索：一次网络请求，两路结果同时返回
+        partition_names = self.search_kwargs.get("partition_names",None)
         logger.info("[混合检索] 正在向 Milvus 发起 hybrid_search 请求...")
         results = client.hybrid_search(
             collection_name=self.collection_name,
+            partition_names = partition_names,#注入灵魂：将物理隔断参数死死钉入数据库引擎查询要求中
             reqs=[dense_search_request, sparse_search_request],  # 发送两路请求
             ranker=rrf_ranker,
             limit=self.top_k,

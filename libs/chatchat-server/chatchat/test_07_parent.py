@@ -19,7 +19,7 @@ from chatchat.server.knowledge_base.kb_service.milvus_kb_service import MilvusKB
 # 我们用你刚才手工重建并导入了持久化真实数据的库
 KB_NAME = "samples"
 # 选一个你之前在 test_06 里测试过的比较细节的查询词
-QUERY = "如何解决连接 Milvus 失败的问题？"
+QUERY = "那个数据库连不上了怎么整？"
 
 def test_real_data_parent_child():
     print("=" * 60)

@@ -62,7 +62,7 @@ class MilvusKBService(KBService):
     def _load_milvus(self):
         self.milvus = Milvus(
             embedding_function=get_Embeddings(self.embed_model),
-            collection_name=self.kb_name,
+            collection_name="enterprise_global_kb", #全局表
             connection_args=Settings.kb_settings.kbs_config.get("milvus"),
             index_params=Settings.kb_settings.kbs_config.get("milvus_kwargs")["index_params"],
             search_params=Settings.kb_settings.kbs_config.get("milvus_kwargs")["search_params"],
@@ -93,7 +93,12 @@ class MilvusKBService(KBService):
         uri = f"http://{conn.get('host', '127.0.0.1')}:{conn.get('port', '19530')}"
         client = MilvusClient(uri=uri)
 
-        col_name = self.kb_name
+        #【核心改造点 1：把局部表提升为公司级大表】- 多用户分表
+        # 把原本的 col_name = self.kb_name 删掉，改为全局固定表：
+        col_name = "enterprise_global_kb"
+        # 然后把传进来的 kb_name 降级作为物理分区名：
+        partition_name = self.kb_name
+
 
         # 检查 collection 是否已经存在，且字段是否完整
         if client.has_collection(col_name):
@@ -149,14 +154,40 @@ class MilvusKBService(KBService):
                                  index_params=index_params)
         print(f"[MilvusKBService] 已为知识库 '{col_name}' 建立混合检索 Collection（Dense + BM25）")
 
+        #【核心改造点 2：为每个库/部门专门创建和加载物理隔离的分区】
+        if not client.has_partition(collection_name=col_name,partition_name=partition_name):
+            client.create_partition(collection_name=col_name,partition_name=partition_name)
+            print(f"[架构进化] 已在总库下，成功为租户 '{partition_name}' 开辟安全沙箱分区！")
+        #为了进一步省内存，我们可以只加载（Load）特定的分区！
+        client.load_partitions(collection_name = col_name,partition_names = [partition_name])
+
+
     def do_init(self):
         self._ensure_hybrid_collection()   # ← 新增：确保双字段 Collection 存在
         self._load_milvus()
 
     def do_drop_kb(self):
-        if self.milvus.col:
-            self.milvus.col.release()
-            self.milvus.col.drop()
+        # if self.milvus.col:
+        #     self.milvus.col.release()
+        #     self.milvus.col.drop()
+        from pymilvus import MilvusClient
+        from chatchat.settings import Settings
+        # 1. 建立连接
+        conn = Settings.kb_settings.kbs_config.get("milvus")
+        uri = f"http://{conn.get('host','127.0.0.1')}:{conn.get('port','19530')}"
+        client = MilvusClient(uri=uri)
+        # 2. 目标表名
+        col_name = "enterprise_global_kb"
+        # 3. 目标分区名（即知识库名）
+        partition_name = self.kb_name
+        # 4. 检查分区是否存在，不存在则创建
+        if client.has_partition(collection_name=col_name, partition_name=partition_name):
+            #先卸载本分区的内存
+            client.release_partitions(collection_name = col_name,partition_names=[partition_name])
+            #再从物理硬盘上销毁本分区（绝对不伤害别的分区内容）
+            client.drop_collection(collection_name=col_name,partition_names=[partition_name])
+            print(f"[数据安全] 已安全销毁租户沙箱分区 '{partition_name}'，其他部门数据未受影响。")
+
 
     def do_search(self, query: str, top_k: int, score_threshold: float):
         """
@@ -173,7 +204,61 @@ class MilvusKBService(KBService):
             1. hybrid_search 召回 Top-20 候选（多召回，宁多勿少）
             2. 如果 USE_RERANKER=true，用 Cross-Encoder 精排，取 Top-3
             3. 返回高质量文档给 LLM
+        ---------
+        改造三：增强查询
+        原理：用 LLM 生成一段假设性的"专业解答"，
+        把它的向量作为检索锚点，弥补口语化 query 的语义特征缺陷。
+        为什么放在这里（do_search 最顶端）？
+        因为要在进入任何检索引擎【之前】就把 query 变形，
+        后面混合检索、父子回拉、Reranker 全都用增强后的 query，
+        一次改动，链路全部升级。
         """
+        from chatchat.server.utils import get_ChatOpenAI,get_default_llm
+        from chatchat.settings import Settings
+
+        try:
+        # 思考二：temperature=0.7 是什么意思？为什么不用 0.0？
+        # temperature 控制模型的"创造力"：
+        # temperature=0.0 → 输出最保守、最确定的答案（适合精确问答）
+        # temperature=0.7 → 输出有一定发散性（适合我们！要它多写术语，不要太死板）
+        # temperature=1.0+ → 太随机，可能偏题
+        # 这里选 0.7 是最佳平衡点。
+            llm = get_ChatOpenAI(
+                model_name=get_default_llm(),
+                temperature=0.7,
+                streaming=False,
+            )
+             # 思考四：这个 Prompt 是怎么设计的？为什么这样写？
+            # 关键点1："不需要绝对正确" → 给 LLM 减压，让它大胆说术语，不要因为不确定就说废话
+            # 关键点2："尽可能使用行业术语" → 直接命题，告诉 LLM 我们要什么
+            # 关键点3："直接输出，不用寒暄" → 避免 LLM 输出"好的，以下是..." 这种废话前缀
+            hyde_prompt = (
+                f"你是一位资深的技术专家，请针对以下用户问题，写一段简明专业的解答。\n"
+                f"要求：\n"
+                f"1. 不需要绝对正确，但必须使用大量该领域的专业术语和缩写\n"
+                f"2. 长度在 100-150 字之间\n"
+                f"3. 直接输出解答内容，不用任何开场白\n"
+                f"用户问题：{query}\n"
+            )
+            logger.info(f"[HyDE] 正在对用户 query 进行语义扩写增强...")
+            # 调用LLM 拿到假设性答案
+            response = llm.invoke(hyde_prompt)
+            hypothetical_answer = response.content.strip()
+            logger.info(f"[HyDE] 扩写完成，假设性答案：{hypothetical_answer[:80]}...")
+            # 思考五：为什么要把原始 query 和假设性答案拼接？而不只用假设性答案？
+            # 答：LLM 虽然会用正确术语，但偶尔会偏题（幻觉严重时）。
+            # 拼接原始 query 起到"锚点"作用，防止语义完全漂移。
+            # 这是工程实践的安全保障。
+            enhanced_query = f"{query}\n{hypothetical_answer}"
+        except Exception as e:
+            #如果LLM超时就用原query
+            logger.warning(f"[HyDE] LLM 超时或报错，将使用原始 query 进行检索：{e}")
+            enhanced_query = query
+
+
+
+
+
         self._load_milvus()
         # embed_func = get_Embeddings(self.embed_model)
         # embeddings = embed_func.embed_query(query)
@@ -184,9 +269,12 @@ class MilvusKBService(KBService):
             top_k=top_k * 5,
             score_threshold=score_threshold,
             # 因为加了父子模块，只对比子段（注意：Milvus 的 sql 表达式中布尔值要用小写 false）
-            search_kwargs = {"expr":"is_parent == false"}
+            search_kwargs = {
+                "expr":"is_parent == false",
+                "partition_names":[self.kb_name]
+                }
         )
-        docs = retriever.get_relevant_documents(query)
+        docs = retriever.get_relevant_documents(enhanced_query)
         # 父子模块--此时的 docs 全是十几到几十个字的精准词条，我们把他们的家谱 ID 抽出来去重
         parent_ids = list(set([str(doc.metadata.get("parent_id")) for doc in docs if doc.metadata.get("parent_id")]))
         if parent_ids:
@@ -197,7 +285,8 @@ class MilvusKBService(KBService):
             # 去 Milvus 中原生拉取这些 ID 对应的父文档（is_parent == true）
             id_str = "[" + ",".join([f"'{id}'" for id in parent_ids ]) + "]"
             parent_res = client.query(
-                collection_name = self.kb_name,
+                collection_name="enterprise_global_kb",
+                partition_names = [self.kb_name], #这里去老祖宗库里捞数据时，也必须守规矩
                 filter=f"parent_id in {id_str} and is_parent == true",
                 output_fields = ["text", "source", "parent_id"]
             )
@@ -300,7 +389,18 @@ class MilvusKBService(KBService):
         #=============修改父子模块============
         # 执行批量插入
         # 这里milvus 会计算BM25需要的向量表
-        result = client.insert(collection_name=self.kb_name, data=data)
+
+        batch_size = 500
+        inserted_ids = []
+
+        for i in range(0, len(data), batch_size):
+            batch_data = data[i : i + batch_size]
+            result = client.insert(
+                collection_name="enterprise_global_kb", 
+                partition_name = self.kb_name,
+                data=batch_data,
+            )
+            inserted_ids.extend(result.get("ids", []))
 
         # 把 Milvus 返回的 id 列表和原始 metadata 打包成上层需要的格式
         inserted_ids = result.get("ids", [])
