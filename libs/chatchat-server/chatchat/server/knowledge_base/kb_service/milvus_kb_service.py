@@ -105,7 +105,11 @@ class MilvusKBService(KBService):
             schema = client.describe_collection(col_name)
             field_names = [f["name"] for f in schema.get("fields", [])]
             if "sparse_vector" in field_names:
-                # 已经有稀疏向量字段，直接返回，无需重建
+                # 已经有稀疏向量字段，先确保分区存在再返回
+                if not client.has_partition(collection_name=col_name,partition_name=partition_name):
+                    client.create_partition(collection_name=col_name,partition_name=partition_name)
+                    print(f"[架构进化] 已在总库下，成功为租户 '{partition_name}' 开辟安全沙箱分区！")
+                client.load_partitions(collection_name = col_name,partition_names = [partition_name])
                 return
             # 字段不完整，删掉旧的
             client.drop_collection(col_name)

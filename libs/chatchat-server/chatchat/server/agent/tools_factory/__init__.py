@@ -13,3 +13,7 @@ from .amap_weather import amap_weather
 from .wikipedia_search import wikipedia_search
 from .text2promql import text2promql
 from .url_reader import url_reader
+from .kb_retrieval_stats import kb_retrieval_stats
+from .rag_quality_inspector import rag_quality_inspector
+from .smart_kb_router import smart_kb_router
+

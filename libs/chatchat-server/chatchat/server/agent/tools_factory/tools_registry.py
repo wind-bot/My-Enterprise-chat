@@ -14,6 +14,7 @@ __all__ = ["regist_tool", "BaseToolOutput", "format_context"]
 
 
 _TOOLS_REGISTRY = {}
+#全局工具注册表
 
 
 # patch BaseTool to support extra fields e.g. a title
@@ -84,7 +85,10 @@ def regist_tool(
     def _parse_tool(t: BaseTool):
         nonlocal description, title
 
-        _TOOLS_REGISTRY[t.name] = t
+        _TOOLS_REGISTRY[t.name] = t # 全局注册 
+        #装饰器会把打包好的这个 StructuredTool 对象，放进一个叫做 _TOOLS_REGISTRY 的全局大字典里。 就像是给工具上户口
+        #你传入的 title="知识库状态查询" 参数，此时会作为一个额外的属性绑定给这个工具对象 （t.title = "知识库状态查询"）。
+        #这个 title 是专门给前端页面（WebUI）看的，这样当用户打开 Chatchat 网页的勾选列表时，看到的就不是冰冷的函数名 kb_retrieval_stats，而是友好的中文”知识库状态查询“
 
         # change default description
         if not description:
@@ -98,6 +102,7 @@ def regist_tool(
             title = "".join([x.capitalize() for x in t.name.split("_")])
         t.title = title
 
+    #使用langchain的tool装饰器来进行包装工具
     def wrapper(def_func: Callable) -> BaseTool:
         partial_ = tool(
             *args,
@@ -105,9 +110,9 @@ def regist_tool(
             args_schema=args_schema,
             infer_schema=infer_schema,
         )
-        t = partial_(def_func)
-        _parse_tool(t)
-        return t
+        t = partial_(def_func)# ← Langchain的tool装饰器把普通函数变成 BaseTool 对象 它会把你写的普通函数包在一个名为 StructuredTool（BaseTool的子类）的”高级壳子“里面，可以让大模型看懂
+        _parse_tool(t)# 3. 对这个对象做手术（加名字、加标题、存入全局字典）
+        return t# 4. 把这个对象返回出去！--装饰器不一定返回函数
 
     if len(args) == 0:
         return wrapper

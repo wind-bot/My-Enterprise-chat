@@ -146,6 +146,19 @@ class PlatformToolsAgentExecutor(AgentExecutor):
         try:
             async with asyncio_timeout(self.max_execution_time):
                 while self._should_continue(iterations, time_elapsed):
+                    # 【Reasoning】思考：把问题+工具+历史步骤 → 发给LLM → 得到决策
+                    """
+                    调 LLM（走 LCEL 链）：
+                    agent_scratchpad（把 intermediate_steps 序列化） 
+                    → prompt（填入占位符）
+                    → llm（LLM 推理）
+                    → output_parser（解析 XML）
+                    → 得到 AgentAction 或 AgentFinish
+                    如果是 AgentAction → 立刻执行工具：
+                    _aperform_agent_action(action)
+                    → tool.arun(action.tool_input)
+                    → 返回 (AgentAction, observation) 元组
+                    """
                     next_step_output = await self._atake_next_step(
                         name_to_tool_map,
                         color_mapping,
@@ -153,14 +166,15 @@ class PlatformToolsAgentExecutor(AgentExecutor):
                         intermediate_steps,
                         run_manager=run_manager,
                     )
+                    # 【Finish】如果 Agent 返回了 AgentFinish，说明思考结束，直接返回结果
                     if isinstance(next_step_output, AgentFinish):
                         return await self._areturn(
                             next_step_output,
                             intermediate_steps,
                             run_manager=run_manager,
                         )
-
-                    intermediate_steps.extend(next_step_output)
+                    # 【Action】把决策变成实际动作（调用工具） 【Action + Observation】LLM 说"我要调工具"，工具已经跑完了
+                    intermediate_steps.extend(next_step_output)  # 记录 (Action, Observation)
                     if len(next_step_output) >= 1:
                         # TODO: platform adapter status control, but langchain not output message info,
                         #   so where after paser instance object to let's DrawingToolAgentAction WebBrowserAgentAction
@@ -311,7 +325,7 @@ class PlatformToolsAgentExecutor(AgentExecutor):
             return [
                 (a.action, a.observation) for a in values if isinstance(a, AgentStep)
             ]
-
+    #执行工具
     async def _aperform_agent_action(
         self,
         name_to_tool_map: Dict[str, BaseTool],

@@ -212,12 +212,13 @@ class PlatformToolsRunnable(RunnableSerializable[Dict, OutputType]):
                 ]
             )
 
+            # === 第 2 步：处理工具（分两类） ===
             assistants_builtin_tools = []
             for t in tools:
                 # TODO: platform tools built-in for all tools,
                 #       load with langchain_chatchat/agents/all_tools_agent.py:108
                 # AdapterAllTool implements it
-                if _is_assistants_builtin_tool(t):
+                if _is_assistants_builtin_tool(t): # 平台内置工具
                     assistants_builtin_tools.append(cls.paser_all_tools(t, final_callbacks))
             temp_tools.extend(assistants_builtin_tools)
 
@@ -233,9 +234,11 @@ class PlatformToolsRunnable(RunnableSerializable[Dict, OutputType]):
                 loop = asyncio.new_event_loop()
 
             asyncio.set_event_loop(loop)
+        # === 第 3 步：连接 MCP 获取外部工具 ===
         client = loop.run_until_complete(cls.create_mcp_client(mcp_connections))
         # Get tools
-        mcp_tools = client.get_tools()
+        mcp_tools = client.get_tools() # ← 拿到 MCP 提供的工具列表
+        # === 第 4 步：调工厂函数创建真正的 AgentExecutor ===
         agent_executor = agents_registry(
             agent_type=agent_type,
             llm=llm,
@@ -246,7 +249,7 @@ class PlatformToolsRunnable(RunnableSerializable[Dict, OutputType]):
             verbose=True,
             **kwargs,
         )
-
+        # === 第 5 步：把所有东西打包，返回自己 ===
         return cls(
             agent_type=agent_type,
             agent_executor=agent_executor,
@@ -256,18 +259,19 @@ class PlatformToolsRunnable(RunnableSerializable[Dict, OutputType]):
             **kwargs,
         )
 
+    #这是 Agent 实际跑起来的地方
     def invoke(
             self, chat_input: str,
             config: Optional[RunnableConfig] = None
     ) -> AsyncIterable[OutputType]:
-        async def chat_iterator() -> AsyncIterable[OutputType]:
+        async def chat_iterator() -> AsyncIterable[OutputType]:  # ← 这是个异步生成器
             history_message = []
             if self.history:
                 _history = [History.from_data(h) for h in self.history]
                 _chat_history = [h.to_msg_tuple() for h in _history]
 
                 history_message.extend(convert_to_messages(_chat_history))
-
+            # ✨ 关键设计：把 AgentExecutor 放到后台 Task 里跑
             task = asyncio.create_task(
                 wrap_done(
                     self.agent_executor.ainvoke(
@@ -280,9 +284,11 @@ class PlatformToolsRunnable(RunnableSerializable[Dict, OutputType]):
                     self.callback.done,
                 )
             )
-
+            # 前台：从 Callback 的队列里一个一个取事件
             async for chunk in self.callback.aiter():
                 data = json.loads(chunk)
+                # 把原始字典（{"status": 2, "text": "你"}）
+                # 翻译成有类型的 Schema 对象
                 class_status = None
                 if data["status"] == AgentStatus.llm_start:
                     class_status = PlatformToolsLLMStatus(
@@ -366,8 +372,8 @@ class PlatformToolsRunnable(RunnableSerializable[Dict, OutputType]):
 
                 yield class_status
 
-            await task
-
+            await task  #  等 AgentExecutor 真正跑完
+            # 跑完后更新状态（留到下次对话用）
             # if self.callback.out:
             self.history.append({"role": "user", "content": chat_input})
             self.history.append(
@@ -375,4 +381,4 @@ class PlatformToolsRunnable(RunnableSerializable[Dict, OutputType]):
             )
             self.intermediate_steps.extend(self.callback.intermediate_steps)
 
-        return chat_iterator()
+        return chat_iterator()# 返回生成器（还没开始跑）

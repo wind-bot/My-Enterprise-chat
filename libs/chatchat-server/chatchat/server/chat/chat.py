@@ -95,8 +95,8 @@ def create_models_chains(
         history.append({"role": "assistant", "content":  message["response"]})  
     #2.装配手脚-就是工具-（MCP拦截处理）
     intermediate_steps = loads(messages[-1].get("metadata", {}).get("intermediate_steps"), valid_namespaces=["langchain_chatchat", "agent_toolkits", "all_tools", "tool"] )  if len(messages)>0 and messages[-1].get("metadata") is not None else []
-    llm = models["action_model"]
-    llm.callbacks = callbacks
+    llm = models["action_model"] #获取模型的agnet 行动模型
+    llm.callbacks = callbacks #监听器
     connections = get_enabled_mcp_connections()
     
     # 转换为MCP连接格式，支持StdioConnection和SSEConnection类型
